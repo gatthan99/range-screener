@@ -3,7 +3,6 @@ Markt-Übersicht
 ---------------
 Lädt Forex, Indizes, Metalle, Energie und Agrar und erzeugt eine handyfreundliche
 Webseite in ./site:
-  * oben eine kompakte Übersicht aller Märkte (Kurs, Veränderung, Lage zum Volumenprofil)
   * je Markt der 1d-Chart mit Volumenprofil und der 4h-Chart (ohne Zonen)
 
 Läuft automatisch über GitHub Actions (siehe .github/workflows/screener.yml).
@@ -31,6 +30,7 @@ KERZEN_4H = 120          # sichtbare 4h-Kerzen
 VP_STUFEN = 48           # Preisstufen im Volumenprofil
 VALUE_AREA = 0.70        # Anteil des Volumens in der Value Area
 AUSGABE = "site"
+BROKER_TZ = "Europe/Athens"  # MT5-Serverzeit (GMT+2 / Sommer GMT+3) = Wien + 1 h
 VERSION = str(int(time.time()))  # hängt an Bildadressen, damit der Browser keine alten Charts zeigt
 
 MAERKTE = {
@@ -75,13 +75,17 @@ def lade_kurse(ticker):
         h1["Volume"] = h1["Volume"].fillna(0)
         h1 = h1[(h1["High"] > 0) & (h1["Low"] > 0)]
         out["1h"] = h1
-        out["4h"] = h1.iloc[-180*24:].resample("4h", origin="start_day").agg(OHLC).dropna()
+        # Kerzen wie beim MT5-Broker (Serverzeit = Wiener Zeit + 1 h, ganzjährig):
+        # 4h-Wechsel um 23, 03, 07, 11, 15, 19 Uhr Wiener Zeit, Tageswechsel um 23 Uhr.
+        # Index der Kerzen = Wiener Ortszeit (ohne Zeitzone), für die Chart-Beschriftung.
+        srv = h1.copy()
+        srv.index = srv.index.tz_convert(BROKER_TZ).tz_localize(None)
+        h4 = srv.iloc[-180*24:].resample("4h", origin="epoch").agg(OHLC).dropna()
+        h4.index = h4.index - pd.Timedelta(hours=1)
+        out["4h"] = h4
     if fx and not h1.empty:
-        # Forex: Yahoo-Tagesdaten haben unzuverlässige Eröffnungskurse ->
-        # 1d-Kerzen aus Stundendaten bauen, Tageswechsel 22:00 UTC (wie MT5-Broker)
-        u = h1.copy()
-        u.index = u.index.tz_convert("UTC") + pd.Timedelta(hours=2)
-        d1 = u.resample("1D").agg(OHLC).dropna()
+        # Forex: Yahoo-Tagesdaten haben unzuverlässige Eröffnungskurse -> aus Stundendaten bauen
+        d1 = srv.resample("1D").agg(OHLC).dropna()
         out["1d"] = d1[d1.index.dayofweek < 5].iloc[-260:]
     else:
         d1 = history(ticker, period="1y", interval="1d")
@@ -101,6 +105,9 @@ def volumenprofil(h1, t0, lo, hi):
     Ohne Volumen (z. B. Forex bei Yahoo) wird ein Zeit-Profil berechnet."""
     if h1 is None or h1.empty or not hi > lo:
         return None
+    t0 = pd.Timestamp(t0)
+    if t0.tzinfo is None:
+        t0 = t0.tz_localize("Europe/Vienna", nonexistent="shift_forward", ambiguous=False)
     sub = h1[h1.index >= t0]
     if len(sub) < 20:
         return None
@@ -281,18 +288,6 @@ def pct(v):
     return f"<span class='{kl}'>{v:+.2f}%</span>"
 
 
-def uebersicht(gruppe, zeilen):
-    rows = []
-    for z in zeilen:
-        d = nk(z["kurs"])
-        rows.append(f"<tr><td><a href='#{anker(z['ticker'])}'>{html.escape(z['markt'])}</a></td>"
-                    f"<td>{z['kurs']:.{d}f}</td><td>{pct(z['tag'])}</td>"
-                    f"<td class='hide-s'>{pct(z['woche'])}</td>"
-                    f"<td class='{z['lage_kl']}'>{z['lage']}</td></tr>")
-    return (f"<h2 id='g-{gruppe}'>{gruppe}</h2><table><tr><th>Markt</th><th>Kurs</th><th>Tag</th>"
-            f"<th class='hide-s'>Woche</th><th>Profil</th></tr>{''.join(rows)}</table>")
-
-
 def karte(z):
     d = nk(z["kurs"])
     vp = z["vp"]
@@ -305,14 +300,13 @@ def karte(z):
                      for tf, p in (("1d", z["c1d"]), ("4h", z["c4h"])) if p)
     return (f"<div class='card' id='{anker(z['ticker'])}'><div class='head'><h3>{html.escape(z['markt'])}</h3>"
             f"</div><div class='info'>{info}</div><div class='charts'>{bilder}</div>"
-            f"<a class='top' href='#top'>↑ Übersicht</a></div>")
+            f"<a class='top' href='#top'>↑ nach oben</a></div>")
 
 
 def seite(stand, ergebnis, fehler):
     gruppen = [g for g in MAERKTE if ergebnis.get(g)]
-    nav = "".join(f"<a href='#g-{g}'>{g}</a>" for g in gruppen) + "<a href='#charts'>Charts</a>"
-    tabellen = "".join(uebersicht(g, ergebnis[g]) for g in gruppen)
-    karten = "".join(f"<h2 id='c-{g}'>{g}</h2>" + "".join(karte(z) for z in ergebnis[g]) for g in gruppen)
+    nav = "".join(f"<a href='#g-{g}'>{g}</a>" for g in gruppen)
+    karten = "".join(f"<h2 id='g-{g}'>{g}</h2>" + "".join(karte(z) for z in ergebnis[g]) for g in gruppen)
     fehltext = f"<p class='mute'>Keine Daten für: {html.escape(', '.join(fehler))}</p>" if fehler else ""
     anzahl = sum(len(v) for v in ergebnis.values())
     return f"""<!doctype html>
@@ -324,13 +318,11 @@ def seite(stand, ergebnis, fehler):
 <h1>📊 Markt-Übersicht</h1>
 <div class="stand">Stand {stand} · {anzahl} Märkte · 1d + 4h</div>
 <nav>{nav}</nav>
-{tabellen}
-<p class="mute" style="font-size:13px">Profil = Lage des Kurses zur Value Area (70 % des Volumens) der letzten
-{KERZEN_1D} Tage. Forex ohne Volumen bei Yahoo → Zeit-Profil.</p>
 {fehltext}
-<h2 id="charts" style="margin-top:34px">📈 Charts</h2>
 {karten}
-<footer>Kurse: Yahoo Finance (Gold, Öl usw. als Futures – können vom CFD abweichen). Keine Anlageberatung.</footer>
+<footer>Volumenprofil über die letzten {KERZEN_1D} Tage, POC orange, Value Area (70 %) blau.
+Forex ohne Volumen bei Yahoo → Zeit-Profil.<br>
+Kurse: Yahoo Finance (Gold, Öl usw. als Futures – können vom CFD abweichen). Keine Anlageberatung.</footer>
 </main></body></html>"""
 
 # ----------------------------------------------------------------------------
