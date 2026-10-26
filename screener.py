@@ -46,6 +46,25 @@ MAERKTE = {
               "SB=F": "Zucker", "CC=F": "Kakao"},
 }
 
+# Positionsrechner: Kurswährung und Kontraktgröße je Lot (typische MT5-CFD-Werte).
+# Die Werte lassen sich auf der Seite anpassen (werden im Browser gespeichert).
+# "USc" = Kurs in US-Cent (z. B. Agrar).
+KONTRAKT = {
+    "^GDAXI": ("EUR", 1), "^GSPC": ("USD", 1), "^NDX": ("USD", 1), "^DJI": ("USD", 1),
+    "^STOXX50E": ("EUR", 1), "^FTSE": ("GBP", 1), "^FCHI": ("EUR", 1), "^N225": ("JPY", 1), "^ATX": ("EUR", 1),
+    "GC=F": ("USD", 100), "SI=F": ("USD", 5000), "PL=F": ("USD", 100), "PA=F": ("USD", 100),
+    "HG=F": ("USD", 25000),
+    "CL=F": ("USD", 1000), "BZ=F": ("USD", 1000), "NG=F": ("USD", 10000),
+    "ZW=F": ("USc", 5000), "ZC=F": ("USc", 5000), "ZS=F": ("USc", 5000), "KC=F": ("USc", 37500),
+    "SB=F": ("USc", 112000), "CC=F": ("USD", 10),
+}
+
+
+def kontrakt(ticker):
+    if ticker.endswith("=X"):
+        return ticker[3:6], 100000
+    return KONTRAKT.get(ticker, ("USD", 1))
+
 # ----------------------------------------------------------------------------
 # Kursdaten (Yahoo Finance)
 # ----------------------------------------------------------------------------
@@ -274,6 +293,21 @@ scroll-margin-top:56px}
 .top{display:inline-block;margin-top:6px;font-size:13px;color:var(--mute);text-decoration:none}
 @media(max-width:480px){.hide-s{display:none}}
 footer{color:var(--mute);font-size:12px;margin:30px 0 10px}
+#rechner h2{margin:0 0 10px}
+.form{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.form label{display:flex;flex-direction:column;gap:4px;font-size:13px;color:var(--mute)}
+.form .voll{grid-column:1/-1}
+.form input,.form select{font:inherit;font-size:16px;color:var(--text);background:#0f1215;
+border:1px solid var(--line);border-radius:10px;padding:9px 10px;width:100%}
+.ergebnis{margin-top:12px;border-top:1px solid var(--line);padding-top:10px}
+.gross{font-size:30px;font-weight:700;line-height:1.1}
+.gross small{font-size:15px;color:var(--mute);font-weight:400}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:3px 12px;margin-top:8px;font-size:14px}
+.kv span:nth-child(odd){color:var(--mute)}
+.warn{color:var(--poc);font-size:13px;margin-top:8px}
+details{margin-top:10px;font-size:14px}
+summary{color:var(--mute);cursor:pointer}
+.calc-link{float:right;font-size:13px;color:var(--poc);text-decoration:none;margin-top:6px}
 """
 
 
@@ -300,12 +334,171 @@ def karte(z):
                      for tf, p in (("1d", z["c1d"]), ("4h", z["c4h"])) if p)
     return (f"<div class='card' id='{anker(z['ticker'])}'><div class='head'><h3>{html.escape(z['markt'])}</h3>"
             f"</div><div class='info'>{info}</div><div class='charts'>{bilder}</div>"
-            f"<a class='top' href='#top'>↑ nach oben</a></div>")
+            f"<a class='top' href='#top'>↑ nach oben</a>"
+            f"<a class='calc-link' href='#rechner' onclick=\"waehle('{z['ticker']}')\">🧮 Position berechnen</a></div>")
+
+
+RECHNER_HTML = """
+<div class="card" id="rechner">
+<h2>🧮 Positionsrechner</h2>
+<div class="form">
+  <label>Kontostand<input id="konto" inputmode="decimal" placeholder="z. B. 10000"></label>
+  <label>Kontowährung<select id="kwaehr"><option>EUR</option><option>USD</option><option>CHF</option><option>GBP</option></select></label>
+  <label>Risiko in %<input id="risiko" inputmode="decimal" value="1"></label>
+  <label>Markt<select id="markt"></select></label>
+  <label>Einstieg<input id="einstieg" inputmode="decimal"></label>
+  <label>Stop-Loss<input id="stop" inputmode="decimal"></label>
+  <label class="voll">Ziel (optional, für CRV)<input id="ziel" inputmode="decimal"></label>
+</div>
+<details><summary>Kontraktdaten dieses Markts (bitte einmal mit MT5 abgleichen)</summary>
+<div class="form" style="margin-top:8px">
+  <label>Kontraktgröße je Lot<input id="kgroesse" inputmode="decimal"></label>
+  <label>Kurswährung<select id="qwaehr"><option>USD</option><option>EUR</option><option>GBP</option>
+  <option>JPY</option><option>CHF</option><option>CAD</option><option>AUD</option><option>NZD</option>
+  <option value="USc">USc (US-Cent)</option></select></label>
+  <label>Lot-Schritt<input id="lotstep" inputmode="decimal" value="0.01"></label>
+  <label>Mindest-Lot<input id="lotmin" inputmode="decimal" value="0.01"></label>
+</div>
+<p class="mute" style="font-size:13px">MT5 → Kurse → Symbol antippen → <i>Details/Spezifikation</i> → „Kontraktgröße“.
+Änderungen werden auf diesem Gerät gespeichert.</p>
+</details>
+<div class="ergebnis" id="ergebnis"></div>
+</div>
+"""
+
+RECHNER_JS = """
+<script>
+const M = __DATEN__;
+const FX = __FX__;
+const $ = id => document.getElementById(id);
+const zahl = v => { const n = parseFloat(String(v).replace(/\\s/g,'').replace(',', '.')); return isFinite(n) ? n : NaN; };
+const ls = { get(k){ try { return localStorage.getItem(k); } catch(e) { return null; } },
+             set(k,v){ try { localStorage.setItem(k, v); } catch(e) {} } };
+const fmt = (v, d=2) => isFinite(v) ? v.toLocaleString('de-AT', {minimumFractionDigits:d, maximumFractionDigits:d}) : '–';
+
+// USD-Wert einer Währungseinheit
+function usdJe(w){
+  if (w === 'USD') return 1;
+  if (w === 'USc') return 0.01;
+  const r = FX[w]; return r ? r : NaN;
+}
+
+function specLaden(m){
+  let s = null; try { s = JSON.parse(ls.get('spec-' + m.t) || 'null'); } catch(e) {}
+  $('kgroesse').value = s ? s.k : m.k;
+  $('qwaehr').value = s ? s.w : m.w;
+  $('lotstep').value = s && s.step ? s.step : '0.01';
+  $('lotmin').value = s && s.min ? s.min : '0.01';
+}
+function specSpeichern(){
+  const m = M[$('markt').value]; if (!m) return;
+  ls.set('spec-' + m.t, JSON.stringify({k: $('kgroesse').value, w: $('qwaehr').value,
+                                         step: $('lotstep').value, min: $('lotmin').value}));
+}
+
+function rechnen(){
+  ls.set('konto', $('konto').value); ls.set('risiko', $('risiko').value); ls.set('kwaehr', $('kwaehr').value);
+  const m = M[$('markt').value]; const out = $('ergebnis');
+  if (!m) { out.innerHTML = ''; return; }
+  const konto = zahl($('konto').value), risiko = zahl($('risiko').value);
+  const ein = zahl($('einstieg').value), stop = zahl($('stop').value), ziel = zahl($('ziel').value);
+  const k = zahl($('kgroesse').value), qw = $('qwaehr').value, kw = $('kwaehr').value;
+  const step = zahl($('lotstep').value) || 0.01, min = zahl($('lotmin').value) || 0.01;
+  if (!(konto > 0 && risiko > 0 && ein > 0 && stop > 0 && k > 0) || ein === stop) {
+    out.innerHTML = '<p class="mute">Kontostand, Risiko, Einstieg und Stop eingeben.</p>'; return;
+  }
+  const umr = usdJe(qw) / usdJe(kw);          // Kurswährung -> Kontowährung
+  if (!isFinite(umr)) { out.innerHTML = '<p class="warn">Kein Umrechnungskurs für ' + qw + '/' + kw + ' verfügbar.</p>'; return; }
+  const richtung = ein > stop ? 'Long' : 'Short';
+  const abstand = Math.abs(ein - stop);
+  const betrag = konto * risiko / 100;
+  const verlustJeLot = abstand * k * umr;
+  const roh = betrag / verlustJeLot;
+  const lots = Math.floor(roh / step + 1e-9) * step;
+  const dec = (String(step).split('.')[1] || '').length;
+  const echt = lots * verlustJeLot;
+  let html = '<div class="gross">' + fmt(lots, dec) + ' <small>Lot · ' + richtung + '</small></div>';
+  html += '<div class="kv">';
+  html += '<span>Risikobetrag</span><span>' + fmt(betrag) + ' ' + kw + '</span>';
+  html += '<span>Tatsächliches Risiko</span><span>' + fmt(echt) + ' ' + kw + ' (' + fmt(echt / konto * 100) + ' %)</span>';
+  if (m.t.endsWith('=X')) {
+    const pip = m.t.indexOf('JPY') >= 0 ? 0.01 : 0.0001;
+    html += '<span>Stop-Abstand</span><span>' + fmt(abstand / pip, 1) + ' Pips</span>';
+    html += '<span>Pip-Wert</span><span>' + fmt(pip * k * umr) + ' ' + kw + ' pro Lot</span>';
+  } else {
+    html += '<span>Stop-Abstand</span><span>' + fmt(abstand, m.d) + ' Punkte</span>';
+    html += '<span>Wert je Punkt</span><span>' + fmt(k * umr) + ' ' + kw + ' pro Lot</span>';
+  }
+  if (ziel > 0) {
+    const okZiel = richtung === 'Long' ? ziel > ein : ziel < ein;
+    if (okZiel) {
+      const gew = Math.abs(ziel - ein) * k * umr * lots;
+      html += '<span>Gewinn bei Ziel</span><span>' + fmt(gew) + ' ' + kw + '</span>';
+      html += '<span>CRV</span><span>' + fmt(Math.abs(ziel - ein) / abstand, 1) + '</span>';
+    } else {
+      html += '<span>Ziel</span><span class="dn">liegt auf der falschen Seite</span>';
+    }
+  }
+  html += '</div>';
+  if (lots < min) html += '<p class="warn">Unter der Mindest-Lotgröße (' + min + ') – das Risiko ist für diesen Stop zu klein.</p>';
+  html += '<p class="warn">Kontraktgröße ' + fmt(k, 0) + ' · Kurswährung ' + qw + ' – bitte einmal mit deinem MT5 prüfen.</p>';
+  out.innerHTML = html;
+}
+
+function waehle(t){
+  const i = M.findIndex(m => m.t === t); if (i < 0) return;
+  $('markt').value = i; specLaden(M[i]);
+  $('einstieg').value = M[i].p; $('stop').value = ''; $('ziel').value = '';
+  rechnen();
+}
+
+(function(){
+  const sel = $('markt');
+  let gruppe = '', og = null;
+  M.forEach((m, i) => {
+    if (m.g !== gruppe) { og = document.createElement('optgroup'); og.label = m.g; sel.appendChild(og); gruppe = m.g; }
+    const o = document.createElement('option'); o.value = i; o.textContent = m.n; og.appendChild(o);
+  });
+  $('konto').value = ls.get('konto') || '';
+  $('risiko').value = ls.get('risiko') || '1';
+  $('kwaehr').value = ls.get('kwaehr') || 'EUR';
+  if (M.length) waehle(M[0].t);
+  sel.addEventListener('change', () => { const m = M[sel.value]; specLaden(m); $('einstieg').value = m.p;
+                                         $('stop').value = ''; $('ziel').value = ''; rechnen(); });
+  ['kgroesse','qwaehr','lotstep','lotmin'].forEach(id => $(id).addEventListener('input', () => { specSpeichern(); rechnen(); }));
+  ['konto','risiko','kwaehr','einstieg','stop','ziel'].forEach(id => $(id).addEventListener('input', rechnen));
+  $('kwaehr').addEventListener('change', rechnen); $('qwaehr').addEventListener('change', () => { specSpeichern(); rechnen(); });
+})();
+</script>
+"""
+
+
+def rechner(ergebnis):
+    import json
+    daten, fx = [], {}
+    for g in MAERKTE:
+        for z in ergebnis.get(g, []):
+            w, k = kontrakt(z["ticker"])
+            d = nk(z["kurs"])
+            daten.append(dict(t=z["ticker"], n=z["markt"], g=g, w=w, k=k, d=d, p=round(z["kurs"], d)))
+            if z["ticker"].endswith("=X"):
+                fx[z["ticker"][:6]] = z["kurs"]
+    usd = {}
+    if "EURUSD" in fx: usd["EUR"] = fx["EURUSD"]
+    if "GBPUSD" in fx: usd["GBP"] = fx["GBPUSD"]
+    if "AUDUSD" in fx: usd["AUD"] = fx["AUDUSD"]
+    if "NZDUSD" in fx: usd["NZD"] = fx["NZDUSD"]
+    if "USDJPY" in fx: usd["JPY"] = 1 / fx["USDJPY"]
+    if "USDCHF" in fx: usd["CHF"] = 1 / fx["USDCHF"]
+    if "USDCAD" in fx: usd["CAD"] = 1 / fx["USDCAD"]
+    js = RECHNER_JS.replace("__DATEN__", json.dumps(daten, ensure_ascii=False)).replace("__FX__", json.dumps(usd))
+    return RECHNER_HTML, js
 
 
 def seite(stand, ergebnis, fehler):
     gruppen = [g for g in MAERKTE if ergebnis.get(g)]
-    nav = "".join(f"<a href='#g-{g}'>{g}</a>" for g in gruppen)
+    nav = "<a href='#rechner'>🧮 Rechner</a>" + "".join(f"<a href='#g-{g}'>{g}</a>" for g in gruppen)
+    rechner_html, rechner_js = rechner(ergebnis)
     karten = "".join(f"<h2 id='g-{g}'>{g}</h2>" + "".join(karte(z) for z in ergebnis[g]) for g in gruppen)
     fehltext = f"<p class='mute'>Keine Daten für: {html.escape(', '.join(fehler))}</p>" if fehler else ""
     anzahl = sum(len(v) for v in ergebnis.values())
@@ -319,11 +512,12 @@ def seite(stand, ergebnis, fehler):
 <div class="stand">Stand {stand} · {anzahl} Märkte · 1d + 4h</div>
 <nav>{nav}</nav>
 {fehltext}
+{rechner_html}
 {karten}
 <footer>Volumenprofil über die letzten {KERZEN_1D} Tage, POC orange, Value Area (70 %) blau.
 Forex ohne Volumen bei Yahoo → Zeit-Profil.<br>
 Kurse: Yahoo Finance (Gold, Öl usw. als Futures – können vom CFD abweichen). Keine Anlageberatung.</footer>
-</main></body></html>"""
+</main>{rechner_js}</body></html>"""
 
 # ----------------------------------------------------------------------------
 # Ablauf
