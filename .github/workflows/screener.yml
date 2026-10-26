@@ -1,0 +1,62 @@
+name: Range-Screener
+
+on:
+  # Ganzjährig um 03:15, 07:15, 11:15, 15:15, 19:15, 23:15 Uhr Wiener Zeit (Mo–Fr),
+  # jeweils 15 Min. nach Schluss einer 4h-Kerze. GitHub rechnet in UTC, daher beide Varianten;
+  # der Job "zeit" lässt nur die zur aktuellen Wiener Zeit passende laufen.
+  schedule:
+    - cron: "15 2,6,10,14,18,22 * * 1-5"   # Winterzeit (MEZ)
+    - cron: "15 1,5,9,13,17,21 * * 1-5"    # Sommerzeit (MESZ)
+  workflow_dispatch:                        # Knopf "Run workflow" zum manuellen Starten
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  zeit:
+    runs-on: ubuntu-latest
+    outputs:
+      lauf: ${{ steps.check.outputs.lauf }}
+    steps:
+      - id: check
+        run: |
+          ZONE=$(TZ=Europe/Vienna date +%Z)
+          PLAN="${{ github.event.schedule }}"
+          LAUF=ja
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            if [ "$ZONE" = "CEST" ] && [ "$PLAN" != "15 1,5,9,13,17,21 * * 1-5" ]; then LAUF=nein; fi
+            if [ "$ZONE" = "CET" ]  && [ "$PLAN" != "15 2,6,10,14,18,22 * * 1-5" ]; then LAUF=nein; fi
+          fi
+          echo "Wiener Zeitzone: $ZONE · Plan: $PLAN · Lauf: $LAUF"
+          echo "lauf=$LAUF" >> "$GITHUB_OUTPUT"
+
+  scan:
+    needs: zeit
+    if: needs.zeit.outputs.lauf == 'ja'
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -U -r requirements.txt
+      - run: python screener.py
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+          name: github-pages-${{ github.run_attempt }}
+      - id: deploy
+        uses: actions/deploy-pages@v4
+        with:
+          artifact_name: github-pages-${{ github.run_attempt }}
