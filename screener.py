@@ -27,6 +27,8 @@ import yfinance as yf
 # ----------------------------------------------------------------------------
 KERZEN_1D = 100          # sichtbare Tageskerzen (= Zeitraum des Volumenprofils)
 KERZEN_4H = 120          # sichtbare 4h-Kerzen
+KORR_TAGE = 60           # Zeitraum der Korrelation (Handelstage, tägliche Renditen)
+KORR_SCHWELLE = 0.70     # ab diesem Wert (positiv oder negativ) gilt ein Paar als stark korreliert
 VP_STUFEN = 48           # Preisstufen im Volumenprofil
 VALUE_AREA = 0.70        # Anteil des Volumens in der Value Area
 AUSGABE = "site"
@@ -238,6 +240,65 @@ def chart_4h(ticker, markt, df):
         return speichern(fig, ticker, "4h")
 
 # ----------------------------------------------------------------------------
+# Korrelation
+# ----------------------------------------------------------------------------
+def korrelation(schluss):
+    """schluss: {Marktname: Serie der Tagesschlusskurse}. Liefert Korrelationsmatrix der
+    täglichen Renditen über die letzten KORR_TAGE gemeinsamen Handelstage."""
+    reihen = {}
+    for name, ser in schluss.items():
+        idx = pd.DatetimeIndex(ser.index)
+        if idx.tz is not None:
+            idx = idx.tz_localize(None)
+        r = pd.Series(ser.to_numpy(float), index=idx.normalize())
+        reihen[name] = r[~r.index.duplicated(keep="last")]
+    df = pd.DataFrame(reihen).sort_index()
+    df = df[df.index.dayofweek < 5].ffill(limit=2)
+    rend = df.pct_change(fill_method=None).iloc[-KORR_TAGE:]
+    return rend.corr(min_periods=int(KORR_TAGE * 0.6))
+
+
+def chart_korrelation(k):
+    n = len(k)
+    with plt.style.context("dark_background"):
+        groesse = max(6.0, 0.24 * n + 1.8)
+        fig, ax = plt.subplots(figsize=(groesse, groesse), dpi=130)
+        fig.patch.set_facecolor(HG)
+        ax.set_facecolor(HG)
+        werte = k.to_numpy(float)
+        bild = ax.imshow(np.ma.masked_invalid(werte), cmap="RdBu_r", vmin=-1, vmax=1)
+        ax.set_xticks(range(n)); ax.set_yticks(range(n))
+        ax.set_xticklabels(k.columns, rotation=90, fontsize=7)
+        ax.set_yticklabels(k.index, fontsize=7)
+        for i in range(n):
+            for j in range(n):
+                v = werte[i, j]
+                if i != j and np.isfinite(v):
+                    ax.text(j, i, f"{v*100:.0f}", ha="center", va="center", fontsize=4.6,
+                            color="white" if abs(v) > 0.55 else "#1b1f24")
+        # Trennlinien zwischen den Gruppen
+        pos = 0
+        for g in MAERKTE:
+            anz = sum(1 for name in k.columns if name in GRUPPE_VON and GRUPPE_VON[name] == g)
+            pos += anz
+            if 0 < pos < n:
+                ax.axhline(pos - 0.5, color="#0b0d10", lw=1.5); ax.axvline(pos - 0.5, color="#0b0d10", lw=1.5)
+        for sp in ax.spines.values():
+            sp.set_color("#333840")
+        cb = fig.colorbar(bild, ax=ax, fraction=0.035, pad=0.02)
+        cb.ax.tick_params(labelsize=7)
+        ax.set_title(f"Korrelation tägl. Renditen · letzte {KORR_TAGE} Handelstage (Werte in %)",
+                     fontsize=9, loc="left", color="#c8ccd2")
+        fig.tight_layout()
+        pfad = "charts/korrelation.png"
+        fig.savefig(os.path.join(AUSGABE, pfad), facecolor=HG)
+        plt.close(fig)
+    return pfad
+
+
+GRUPPE_VON = {name: g for g, m in MAERKTE.items() for name in m.values()}
+
+# ----------------------------------------------------------------------------
 # Kennzahlen für die Übersicht
 # ----------------------------------------------------------------------------
 def kennzahlen(d1, vp):
@@ -308,6 +369,13 @@ border:1px solid var(--line);border-radius:10px;padding:9px 10px;width:100%}
 details{margin-top:10px;font-size:14px}
 summary{color:var(--mute);cursor:pointer}
 .calc-link{float:right;font-size:13px;color:var(--poc);text-decoration:none;margin-top:6px}
+.korr img{width:100%;height:auto;border-radius:8px;border:1px solid var(--line);display:block;margin-top:8px}
+.paare{display:grid;grid-template-columns:1fr;gap:0;margin-top:6px}
+.paare div{display:flex;justify-content:space-between;gap:10px;padding:7px 0;border-top:1px solid var(--line);font-size:14px}
+.paare div:first-child{border-top:0}
+.paare b{font-variant-numeric:tabular-nums}
+.kpos{color:#e0705f}.kneg{color:#5b9bd5}
+@media(min-width:820px){.paare{grid-template-columns:1fr 1fr;column-gap:24px}}
 """
 
 
@@ -495,9 +563,49 @@ def rechner(ergebnis):
     return RECHNER_HTML, js
 
 
-def seite(stand, ergebnis, fehler):
+def korr_abschnitt(k, bild):
+    if k is None or k.empty:
+        return ""
+    paare = []
+    namen = list(k.columns)
+    for i in range(len(namen)):
+        for j in range(i + 1, len(namen)):
+            v = k.iat[i, j]
+            if np.isfinite(v) and abs(v) >= KORR_SCHWELLE:
+                paare.append((v, namen[i], namen[j]))
+    pos = sorted([p for p in paare if p[0] > 0], reverse=True)
+    neg = sorted([p for p in paare if p[0] < 0])
+
+    def zeilen(pp):
+        return "".join(f"<div><span>{html.escape(a)} ↔ {html.escape(b)}</span>"
+                       f"<b class='{'kpos' if v > 0 else 'kneg'}'>{v:+.2f}</b></div>" for v, a, b in pp)
+
+    def liste(pp, top=10):
+        if not pp:
+            return "<p class='mute'>Keine.</p>"
+        out = f"<div class='paare'>{zeilen(pp[:top])}</div>"
+        if len(pp) > top:
+            out += (f"<details><summary>{len(pp) - top} weitere anzeigen</summary>"
+                    f"<div class='paare'>{zeilen(pp[top:])}</div></details>")
+        return out
+
+    return f"""<h2 id="korrelation">🔗 Korrelation</h2>
+<div class="card korr">
+<p class="info">Wie ähnlich sich die Märkte in den letzten {KORR_TAGE} Handelstagen bewegt haben
+(tägliche Renditen). <b>+1</b> = laufen gleich, <b>−1</b> = laufen entgegengesetzt, 0 = kein Zusammenhang.
+Zwei Trades in stark positiv korrelierten Märkten in dieselbe Richtung sind praktisch ein doppeltes Risiko –
+bei stark negativ korrelierten gilt das für entgegengesetzte Richtungen.</p>
+<h3 style="margin:14px 0 2px;font-size:16px">Stark positiv (≥ {KORR_SCHWELLE:.2f})</h3>{liste(pos)}
+<h3 style="margin:14px 0 2px;font-size:16px">Stark negativ (≤ −{KORR_SCHWELLE:.2f})</h3>{liste(neg)}
+<img loading="lazy" src="{bild}?v={VERSION}" alt="Korrelations-Heatmap">
+<p class="mute" style="font-size:13px">Bild zum Vergrößern mit zwei Fingern aufziehen. Rot = gleichläufig, Blau = gegenläufig.</p>
+</div>"""
+
+
+def seite(stand, ergebnis, fehler, korr_html=""):
     gruppen = [g for g in MAERKTE if ergebnis.get(g)]
-    nav = "<a href='#rechner'>🧮 Rechner</a>" + "".join(f"<a href='#g-{g}'>{g}</a>" for g in gruppen)
+    nav = ("<a href='#rechner'>🧮 Rechner</a>" + "".join(f"<a href='#g-{g}'>{g}</a>" for g in gruppen)
+           + ("<a href='#korrelation'>🔗 Korrelation</a>" if korr_html else ""))
     rechner_html, rechner_js = rechner(ergebnis)
     karten = "".join(f"<h2 id='g-{g}'>{g}</h2>" + "".join(karte(z) for z in ergebnis[g]) for g in gruppen)
     fehltext = f"<p class='mute'>Keine Daten für: {html.escape(', '.join(fehler))}</p>" if fehler else ""
@@ -514,6 +622,7 @@ def seite(stand, ergebnis, fehler):
 {fehltext}
 {rechner_html}
 {karten}
+{korr_html}
 <footer>Volumenprofil über die letzten {KERZEN_1D} Tage, POC orange, Value Area (70 %) blau.
 Forex ohne Volumen bei Yahoo → Zeit-Profil.<br>
 Kurse: Yahoo Finance (Gold, Öl usw. als Futures – können vom CFD abweichen). Keine Anlageberatung.</footer>
@@ -524,7 +633,7 @@ Kurse: Yahoo Finance (Gold, Öl usw. als Futures – können vom CFD abweichen).
 # ----------------------------------------------------------------------------
 def main():
     os.makedirs(os.path.join(AUSGABE, "charts"), exist_ok=True)
-    ergebnis, fehler = {}, []
+    ergebnis, fehler, schluss = {}, [], {}
     alle = [(g, t, n) for g, m in MAERKTE.items() for t, n in m.items()]
     for i, (gruppe, t, name) in enumerate(alle, 1):
         print(f"{i}/{len(alle)} {name}")
@@ -540,11 +649,20 @@ def main():
         z["c1d"] = chart_1d(t, name, d1, vp)
         z["c4h"] = chart_4h(t, name, h4.iloc[-KERZEN_4H:]) if h4 is not None and not h4.empty else None
         ergebnis.setdefault(gruppe, []).append(z)
+        schluss[name] = k["1d"]["Close"]
         time.sleep(0.5)
 
     stand = datetime.now(ZoneInfo("Europe/Vienna")).strftime("%d.%m.%Y %H:%M")
+    korr_html = ""
+    try:
+        k = korrelation(schluss)
+        k = k.dropna(how="all").dropna(axis=1, how="all")
+        if len(k) > 1:
+            korr_html = korr_abschnitt(k, chart_korrelation(k))
+    except Exception as ex:
+        print("Korrelation fehlgeschlagen:", ex)
     with open(os.path.join(AUSGABE, "index.html"), "w", encoding="utf-8") as f:
-        f.write(seite(stand, ergebnis, fehler))
+        f.write(seite(stand, ergebnis, fehler, korr_html))
     print(f"Fertig: {sum(len(v) for v in ergebnis.values())} Märkte, {len(fehler)} ohne Daten")
 
 
